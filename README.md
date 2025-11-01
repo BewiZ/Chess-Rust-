@@ -1,2 +1,2 @@
 # Chess-Rust-
-All AI do it.
+It is all done by AI.
