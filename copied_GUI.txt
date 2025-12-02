@@ -1,0 +1,584 @@
+use eframe::egui;
+use egui::{
+    pos2, 
+    Color32, 
+    Context, 
+    Painter, 
+    Rect, 
+    Response, 
+    Sense, 
+    TextStyle,
+    Ui,
+    Vec2,
+
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use tokio::runtime::Runtime;
+
+// ========== 复用你提供的核心棋子/AI代码 ==========
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    White,
+    Black,
+}
+
+impl Color {
+    pub fn opposite(&self) -> Self {
+        match self {
+            Color::White => Color::Black,
+            Color::Black => Color::White,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieceType {
+    Pawn,
+    Knight,
+    Bishop,
+    Rook,
+    Queen,
+    King,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Piece {
+    pub color: Color,
+    pub piece_type: PieceType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub row: u8,
+    pub col: u8,
+}
+
+impl Position {
+    // 从国际象棋记谱法（如a1, h8）转换为坐标
+    pub fn from_notation(notation: &str) -> Option<Self> {
+        if notation.len() != 2 {
+            return None;
+        }
+        let mut chars = notation.chars();
+        let col_char = chars.next()?;
+        let row_char = chars.next()?;
+
+        let col = (col_char as u8 - b'a') as u8;
+        let row = (row_char.to_digit(10)? as u8 - 1) as u8;
+
+        if col > 7 || row > 7 {
+            return None;
+        }
+        Some(Self { row, col })
+    }
+
+    // 转换为国际象棋记谱法
+    pub fn to_notation(&self) -> String {
+        let col_char = (b'a' + self.col) as char;
+        let row_char = (self.row + 1).to_string();
+        format!("{}{}", col_char, row_char)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Move {
+    pub from: Position,
+    pub to: Position,
+    pub promotion: Option<PieceType>, // 兵升变
+}
+
+impl Move {
+    pub fn from_notation(notation: &str) -> Option<Self> {
+        if notation.len() < 4 || notation.len() > 5 {
+            return None;
+        }
+        let from_str = &notation[0..2];
+        let to_str = &notation[2..4];
+        let promotion = if notation.len() == 5 {
+            match notation.chars().nth(4)? {
+                'q' => Some(PieceType::Queen),
+                'r' => Some(PieceType::Rook),
+                'b' => Some(PieceType::Bishop),
+                'n' => Some(PieceType::Knight),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Some(Self {
+            from: Position::from_notation(from_str)?,
+            to: Position::from_notation(to_str)?,
+            promotion,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Chessboard {
+    pub board: [[Option<Piece>; 8]; 8],
+    pub current_turn: Color,
+    pub selected_pos: Option<Position>,
+    pub ai_client: SiliconFlowClient,
+    pub ai_suggested_move: Option<Move>,
+    pub status_message: String,
+}
+
+impl Chessboard {
+    pub fn new(api_key: String) -> Self {
+        let mut board = [[None; 8]; 8];
+        // 初始化白方棋子
+        board[0][0] = Some(Piece { color: Color::White, piece_type: PieceType::Rook });
+        board[0][1] = Some(Piece { color: Color::White, piece_type: PieceType::Knight });
+        board[0][2] = Some(Piece { color: Color::White, piece_type: PieceType::Bishop });
+        board[0][3] = Some(Piece { color: Color::White, piece_type: PieceType::Queen });
+        board[0][4] = Some(Piece { color: Color::White, piece_type: PieceType::King });
+        board[0][5] = Some(Piece { color: Color::White, piece_type: PieceType::Bishop });
+        board[0][6] = Some(Piece { color: Color::White, piece_type: PieceType::Knight });
+        board[0][7] = Some(Piece { color: Color::White, piece_type: PieceType::Rook });
+        for col in 0..8 {
+            board[1][col] = Some(Piece { color: Color::White, piece_type: PieceType::Pawn });
+        }
+
+        // 初始化黑方棋子
+        board[7][0] = Some(Piece { color: Color::Black, piece_type: PieceType::Rook });
+        board[7][1] = Some(Piece { color: Color::Black, piece_type: PieceType::Knight });
+        board[7][2] = Some(Piece { color: Color::Black, piece_type: PieceType::Bishop });
+        board[7][3] = Some(Piece { color: Color::Black, piece_type: PieceType::Queen });
+        board[7][4] = Some(Piece { color: Color::Black, piece_type: PieceType::King });
+        board[7][5] = Some(Piece { color: Color::Black, piece_type: PieceType::Bishop });
+        board[7][6] = Some(Piece { color: Color::Black, piece_type: PieceType::Knight });
+        board[7][7] = Some(Piece { color: Color::Black, piece_type: PieceType::Rook });
+        for col in 0..8 {
+            board[6][col] = Some(Piece { color: Color::Black, piece_type: PieceType::Pawn });
+        }
+
+        Self {
+            board,
+            current_turn: Color::White,
+            selected_pos: None,
+            ai_client: SiliconFlowClient::new(api_key),
+            ai_suggested_move: None,
+            status_message: "游戏开始，白方先行".to_string(),
+        }
+    }
+
+    // 转换为FEN格式（简化版）
+    pub fn to_fen(&self) -> String {
+        let mut fen = String::new();
+        for row in 0..8 {
+            let mut empty = 0;
+            for col in 0..8 {
+                match self.board[row][col] {
+                    None => empty += 1,
+                    Some(piece) => {
+                        if empty > 0 {
+                            fen.push_str(&empty.to_string());
+                            empty = 0;
+                        }
+                        let c = match (piece.color, piece.piece_type) {
+                            (Color::White, PieceType::Pawn) => 'P',
+                            (Color::White, PieceType::Knight) => 'N',
+                            (Color::White, PieceType::Bishop) => 'B',
+                            (Color::White, PieceType::Rook) => 'R',
+                            (Color::White, PieceType::Queen) => 'Q',
+                            (Color::White, PieceType::King) => 'K',
+                            (Color::Black, PieceType::Pawn) => 'p',
+                            (Color::Black, PieceType::Knight) => 'n',
+                            (Color::Black, PieceType::Bishop) => 'b',
+                            (Color::Black, PieceType::Rook) => 'r',
+                            (Color::Black, PieceType::Queen) => 'q',
+                            (Color::Black, PieceType::King) => 'k',
+                        };
+                        fen.push(c);
+                    }
+                }
+            }
+            if empty > 0 {
+                fen.push_str(&empty.to_string());
+            }
+            if row < 7 {
+                fen.push('/');
+            }
+        }
+        fen.push_str(match self.current_turn {
+            Color::White => " w ",
+            Color::Black => " b ",
+        });
+        fen.push_str("- - 0 1"); // 简化：王车易位/吃过路兵/半回合/全回合
+        fen
+    }
+
+    // 处理棋盘点击
+    pub fn handle_click(&mut self, pos: Position) {
+        // 1. 未选中棋子：选中当前回合的棋子
+        if self.selected_pos.is_none() {
+            if let Some(piece) = self.board[pos.row as usize][pos.col as usize] {
+                if piece.color == self.current_turn {
+                    self.selected_pos = Some(pos);
+                    self.status_message = format!("选中：{}", pos.to_notation());
+                } else {
+                    self.status_message = "只能选择当前回合的棋子！".to_string();
+                }
+            } else {
+                self.status_message = "该位置无棋子！".to_string();
+            }
+            return;
+        }
+
+        // 2. 已选中棋子：处理移动
+        let selected = self.selected_pos.unwrap();
+        if selected == pos {
+            // 取消选中
+            self.selected_pos = None;
+            self.status_message = "取消选中".to_string();
+            return;
+        }
+
+        // 执行移动（简化版：未做合法走法校验，可根据需求补充）
+        let piece = self.board[selected.row as usize][selected.col as usize].take();
+        if let Some(mut p) = piece {
+            // 兵升变判断（简化）
+            if p.piece_type == PieceType::Pawn && (pos.row == 0 || pos.row == 7) {
+                p.piece_type = PieceType::Queen; // 默认升变为后
+            }
+            self.board[pos.row as usize][pos.col as usize] = Some(p);
+            self.selected_pos = None;
+            self.current_turn = self.current_turn.opposite();
+            self.status_message = format!(
+                "移动：{} → {}，当前回合：{:?}",
+                selected.to_notation(),
+                pos.to_notation(),
+                self.current_turn
+            );
+        }
+    }
+
+    // 获取AI推荐走法
+    pub fn get_ai_move(&mut self) {
+        let fen = self.to_fen();
+        let rt = Runtime::new().unwrap();
+        let ai_client = self.ai_client.clone();
+        
+        match rt.block_on(ai_client.get_best_move(&fen)) {
+            Ok(mv) => {
+                self.ai_suggested_move = Some(mv);
+                self.status_message = format!(
+                    "AI推荐走法：{} → {}",
+                    mv.from.to_notation(),
+                    mv.to.to_notation()
+                );
+            }
+            Err(e) => {
+                self.status_message = format!("AI请求失败：{}", e);
+                self.ai_suggested_move = None;
+            }
+        }
+    }
+
+    // 执行AI推荐的走法
+    pub fn execute_ai_move(&mut self) {
+        if let Some(mv) = self.ai_suggested_move {
+            self.handle_click(mv.from);
+            self.handle_click(mv.to);
+            self.ai_suggested_move = None;
+        } else {
+            self.status_message = "暂无AI推荐走法！".to_string();
+        }
+    }
+}
+
+// ========== 你提供的SiliconFlowClient ==========
+#[derive(Debug, Serialize, Clone)]
+struct AiRequest {
+    fen: String,
+    depth: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiResponse {
+    best_move: String,
+    score: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SiliconFlowClient {
+    client: Client,
+    api_key: String,
+    base_url: String,
+}
+
+impl SiliconFlowClient {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            client: Client::new(),
+            api_key,
+            base_url: "https://api.siliconflow.com/v1/chess/analyze".to_string(),
+        }
+    }
+
+    pub async fn get_best_move(&self, fen: &str) -> Result<Move, Box<dyn Error>> {
+        let request = AiRequest {
+            fen: fen.to_string(),
+            depth: Some(8), // 国际象棋推荐深度8
+        };
+
+        let response = self
+            .client
+            .post(&self.base_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(format!("API请求失败：{}", response.status()).into());
+        }
+
+        let ai_response: AiResponse = response.json().await?;
+        Move::from_notation(&ai_response.best_move)
+            .ok_or_else(|| "API返回无效走法格式".into())
+    }
+}
+
+// ========== GUI绘制逻辑 ==========
+impl Chessboard {
+    pub fn draw_board(&mut self, ui: &mut Ui, ctx: &Context) -> Response {
+        const BOARD_SIZE: f32 = 600.0;
+        const CELL_SIZE: f32 = BOARD_SIZE / 8.0;
+        
+        // 获取字体ID
+        let small_font = ctx.style().text_styles.get(&TextStyle::Body).unwrap().clone();
+
+        let mut chess_font = ctx.style().text_styles.get(&TextStyle::Body).unwrap().clone();
+        chess_font.size = CELL_SIZE * 0.8;
+
+        // 分配绘制区域
+        let (response, painter) = ui.allocate_painter(
+            Vec2::new(BOARD_SIZE, BOARD_SIZE),
+            Sense::click(),
+        );
+        let rect = response.rect;
+        let origin = rect.min;
+
+        // 1. 绘制斑马纹棋盘（交替颜色）
+        let light_color = Color32::from_rgb(240, 217, 181); // 米白色
+        let dark_color = Color32::from_rgb(181, 136, 99);  // 深棕色
+        for row in 0..8 {
+            for col in 0..8 {
+                let x = origin.x + col as f32 * CELL_SIZE;
+                let y = origin.y + row as f32 * CELL_SIZE;
+                let cell_rect = Rect::from_min_size(pos2(x, y), Vec2::splat(CELL_SIZE));
+                
+                // 斑马纹：行+列奇偶性决定颜色
+                let color = if (row + col) % 2 == 0 { light_color } else { dark_color };
+                painter.rect_filled(cell_rect, 0.0, color);
+
+                // 绘制坐标标注（a-h, 1-8）
+                if row == 7 {
+                    let col_label = (b'a' + col) as char;
+                    painter.text(
+                        pos2(x + CELL_SIZE/2.0, y + CELL_SIZE - 8.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        col_label.to_string(),
+                        small_font.clone(),
+                        Color32::BLACK,
+                    );
+                }
+                if col == 0 {
+                    let row_label = (8 - row).to_string();
+                    painter.text(
+                        pos2(x + 8.0, y + CELL_SIZE/2.0),
+                        egui::Align2::LEFT_CENTER,
+                        row_label,
+                        small_font.clone(),
+                        Color32::BLACK,
+                    );
+                }
+            }
+        }
+
+        // 2. 绘制选中棋子的高亮框
+        if let Some(selected) = self.selected_pos {
+            let x = origin.x + selected.col as f32 * CELL_SIZE;
+            let y = origin.y + selected.row as f32 * CELL_SIZE;
+            let selected_rect = Rect::from_min_size(pos2(x, y), Vec2::splat(CELL_SIZE));
+            painter.rect_stroke(selected_rect, 0.0, egui::Stroke::new(4.0, Color32::RED), egui::StrokeKind::Inside);
+        }
+
+        // 3. 绘制AI推荐走法的标记
+        if let Some(ai_move) = self.ai_suggested_move {
+            // 起点标记（黄色）
+            let from_x = origin.x + ai_move.from.col as f32 * CELL_SIZE;
+            let from_y = origin.y + ai_move.from.row as f32 * CELL_SIZE;
+            let from_rect = Rect::from_min_size(pos2(from_x, from_y), Vec2::splat(CELL_SIZE));
+            painter.rect_stroke(from_rect, 0.0, egui::Stroke::new(3.0, Color32::YELLOW), egui::StrokeKind::Inside);
+            
+            // 终点标记（绿色）
+            let to_x = origin.x + ai_move.to.col as f32 * CELL_SIZE;
+            let to_y = origin.y + ai_move.to.row as f32 * CELL_SIZE;
+            let to_rect = Rect::from_min_size(pos2(to_x, to_y), Vec2::splat(CELL_SIZE));
+            painter.rect_stroke(to_rect, 0.0, egui::Stroke::new(3.0, Color32::GREEN), egui::StrokeKind::Inside);
+        }
+
+        // 4. 绘制棋子
+        for row in 0..8 {
+            for col in 0..8 {
+                if let Some(piece) = self.board[row][col] {
+                    let x = origin.x + col as f32 * CELL_SIZE + CELL_SIZE/2.0;
+                    let y = origin.y + row as f32 * CELL_SIZE + CELL_SIZE/2.0;
+                    let center = pos2(x, y);
+                    
+                    // 绘制棋子（简化版：用字符表示，可替换为图标）
+                    let (char, color) = match (piece.color, piece.piece_type) {
+                        (Color::White, PieceType::Pawn) => ('♙', Color32::WHITE),
+                        (Color::White, PieceType::Knight) => ('♘', Color32::WHITE),
+                        (Color::White, PieceType::Bishop) => ('♗', Color32::WHITE),
+                        (Color::White, PieceType::Rook) => ('♖', Color32::WHITE),
+                        (Color::White, PieceType::Queen) => ('♕', Color32::WHITE),
+                        (Color::White, PieceType::King) => ('♔', Color32::WHITE),
+                        (Color::Black, PieceType::Pawn) => ('♟', Color32::BLACK),
+                        (Color::Black, PieceType::Knight) => ('♞', Color32::BLACK),
+                        (Color::Black, PieceType::Bishop) => ('♝', Color32::BLACK),
+                        (Color::Black, PieceType::Rook) => ('♜', Color32::BLACK),
+                        (Color::Black, PieceType::Queen) => ('♛', Color32::BLACK),
+                        (Color::Black, PieceType::King) => ('♚', Color32::BLACK),
+                    };
+                    
+                    painter.text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        char.to_string(),
+                        chess_font.clone(),
+                        color,
+                    );
+                }
+            }
+        }
+
+        // 5. 处理棋盘点击事件
+        if response.clicked() {
+            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                let rel_x = pointer_pos.x - origin.x;
+                let rel_y = pointer_pos.y - origin.y;
+                let col = (rel_x / CELL_SIZE) as u8;
+                let row = (rel_y / CELL_SIZE) as u8;
+                
+                if col < 8 && row < 8 {
+                    self.handle_click(Position { row: row, col: col });
+                }
+            }
+        }
+
+        response
+    }
+}
+
+
+// ========== eframe应用入口 ==========
+struct ChessApp {
+    chessboard: Chessboard,
+    api_key_input: String,
+}
+
+impl Default for ChessApp {
+    fn default() -> Self {
+        Self {
+            chessboard: Chessboard::new("".to_string()),
+            api_key_input: String::new(),
+        }
+    }
+}
+
+impl eframe::App for ChessApp {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("国际象棋 GUI");
+            
+            // 顶部控制面板
+            ui.horizontal(|ui| {
+                ui.label("SiliconFlow API Key：");
+                ui.text_edit_singleline(&mut self.api_key_input);
+                if ui.button("设置API Key").clicked() {
+                    self.chessboard.ai_client = SiliconFlowClient::new(self.api_key_input.clone());
+                    self.chessboard.status_message = "API Key已更新".to_string();
+                }
+            });
+            
+            ui.separator();
+            
+            // 功能按钮
+            ui.horizontal(|ui| {
+                if ui.button("获取AI推荐走法").clicked() {
+                    self.chessboard.get_ai_move();
+                }
+                if ui.button("执行AI走法").clicked() {
+                    self.chessboard.execute_ai_move();
+                }
+                if ui.button("重置棋盘").clicked() {
+                    self.chessboard = Chessboard::new(self.api_key_input.clone());
+                }
+            });
+            
+            ui.separator();
+            
+            // 状态信息
+            ui.label(egui::RichText::new(self.chessboard.status_message.clone()).size(20.0).color(Color32::WHITE));
+            
+            ui.separator();
+            
+            // 居中绘制棋盘
+            ui.vertical_centered(|ui| {
+                self.chessboard.draw_board(ui, ctx);
+            });
+        });
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    // ===== 新增：配置微软雅黑字体 =====
+    let mut fonts = egui::FontDefinitions::default();
+    
+    // 加载微软雅黑字体（Windows系统默认路径，其他系统需替换字体文件路径）
+    fonts.font_data.insert(
+        "microsoft_yhei".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "C:\\Windows\\Fonts\\msyh.ttc"
+        ))),
+    );
+
+
+    // 方案B：加载黑体（备用，若微软雅黑不存在）
+    // fonts.font_data.insert(
+    //     "simhei".to_owned(),
+    //     egui::FontData::from_static(include_bytes!("C:\\Windows\\Fonts\\simhei.ttf"))
+    //         .tweak(egui::FontTweak::default().family(egui::FontFamily::Sans)),
+    // );
+
+    // 修正：字体家族引用必须与上面的Key一致
+    for (text_style, font_families) in fonts.families.iter_mut() {
+        font_families.clear();
+        font_families.push("microsoft_yhei".to_owned()); // 匹配上面的Key
+        // font_families.push("simhei".to_owned()); // 若用黑体则选这个
+    }
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0]), // 替代 initial_window_size
+        multisampling: 4,
+        renderer: eframe::Renderer::Glow,
+        ..eframe::NativeOptions::default()
+    };
+
+    
+    eframe::run_native(
+        "国际象棋 GUI",
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(ChessApp::default()))
+        }),
+    )
+}
