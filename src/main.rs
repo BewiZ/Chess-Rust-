@@ -2,8 +2,7 @@ use eframe::egui;
 use egui::{
     pos2, 
     Color32, 
-    Context, 
-    Painter, 
+    Context,
     Rect, 
     Response, 
     Sense, 
@@ -16,9 +15,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
-    fmt,
-    env,
-    io,
+    fmt
 };
 use tokio::runtime::Runtime;
 use rand::Rng;
@@ -242,7 +239,6 @@ struct AiRequest {
 #[derive(Debug, Deserialize)]
 struct AiResponse {
     best_move: String,
-    score: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +294,10 @@ pub struct Chessboard {
     pub ai_client: SiliconFlowClient,
     pub ai_suggested_move: Option<Move>,
     pub status_message: String,
+    pub show_move_history: bool,
+
+    // 新增：待升变的移动信息 (from, to, color)
+    pub pending_promotion: Option<(Position, Position, Color)>,
 }
 
 impl Chessboard {
@@ -341,6 +341,8 @@ impl Chessboard {
             ai_client: SiliconFlowClient::new(api_key),
             ai_suggested_move: None,
             status_message: "游戏开始，白方先行".to_string(),
+            show_move_history: false,
+            pending_promotion: None, // 初始化升变等待状态
         }
     }
 
@@ -815,7 +817,7 @@ impl Chessboard {
                 Piece::Knight(_) => "N",
                 _ => "",
             };
-            self.move_history.push(format!("{}{}", move_notation, promotion_symbol));
+            self.move_history.push(format!("{} {}", move_notation, promotion_symbol));
         } else {
             self.move_history.push(move_notation);
         }
@@ -1079,6 +1081,12 @@ impl Chessboard {
     // ========== GUI交互逻辑 ==========
     // 处理棋盘点击
     pub fn handle_click(&mut self, click_pos: Position) {
+        // 如果有未完成的升变，直接返回（避免干扰）
+        if self.pending_promotion.is_some() {
+            self.status_message = "请先完成兵升变选择！".to_string();
+            return;
+        }
+    
         // 1. 未选中棋子：选中当前回合的棋子
         if self.selected_pos.is_none() {
             if let Some(piece) = self.get(click_pos) {
@@ -1110,26 +1118,69 @@ impl Chessboard {
             promotion: None, // 兵升变默认后，可扩展GUI选择
         };
 
+        // 先检查是否是合法移动（不执行）
+        let legal_moves = self.get_legal_moves(selected);
+        if !legal_moves.iter().any(|m| m.from == selected && m.to == click_pos) {
+            self.status_message = format!("非法移动：{} → {}", selected.to_notation(), click_pos.to_notation());
+            return;
+        }
+
+        // 检查是否是兵升变
+        if let Some(Piece::Pawn(color, _)) = self.get(selected) {
+            let promotion_row = match color {
+                Color::White => 0,
+                Color::Black => 7,
+            };
+            if click_pos.row == promotion_row {
+                // 标记待升变，暂停执行移动
+                self.pending_promotion = Some((selected, click_pos, color));
+                self.status_message = format!(
+                    "兵升变！请选择升变的棋子：{} → {}",
+                    selected.to_notation(),
+                    click_pos.to_notation()
+                );
+                self.selected_pos = None; // 清空选中状态
+                return;
+            }
+        }
+        // 非升变移动，直接执行
         match self.make_move(&mv) {
-            Ok(_) => {
-                self.selected_pos = None;
-                // 自动处理兵升变（如果需要）
-                if let Some(Piece::Pawn(color, _)) = self.get(click_pos) {
-                    let promotion_row = match color {
-                        Color::White => 0,
-                        Color::Black => 7,
-                    };
-                    if click_pos.row == promotion_row {
-                        let mut promote_move = mv;
-                        promote_move.promotion = Some(Piece::Queen(color));
-                        self.make_move_unchecked(&promote_move);
-                        self.status_message = format!("兵升变！{} → {} (后)", selected.to_notation(), click_pos.to_notation());
+            Ok(_) => self.selected_pos = None,
+            Err(e) => self.status_message = e,
+        }
+    }
+
+    /// 执行兵升变移动
+    pub fn execute_promotion(&mut self, promotion_piece: Piece) {
+        if let Some((from, to, _)) = self.pending_promotion.take() {
+            let mv = Move {
+                from,
+                to,
+                promotion: Some(promotion_piece),
+            };
+
+            match self.make_move(&mv) {
+                Ok(_) => {
+                    self.status_message = format!(
+                        "兵升变成功！{} → {} ({})",
+                        from.to_notation(),
+                        to.to_notation(),
+                        promotion_piece.name()
+                    );
+                    // 检查将死/僵局
+                    if self.is_checkmate() {
+                        self.status_message = format!("将死！{}获胜！", self.current_turn.opposite());
+                    } else if self.is_stalemate() {
+                        self.status_message = "僵局！游戏平局！".to_string();
                     }
                 }
+                Err(e) => {
+                    self.status_message = format!("升变失败：{}", e);
+                    self.pending_promotion = Some((from, to, promotion_piece.color())); // 保留升变状态，允许重新选择
+                }
             }
-            Err(e) => {
-                self.status_message = e;
-            }
+        } else {
+            self.status_message = "无待升变的兵！".to_string();
         }
     }
 
@@ -1150,7 +1201,13 @@ impl Chessboard {
             }
             Err(e) => {
                 self.status_message = format!("AI请求失败：{}，使用随机走法", e);
-                self.ai_suggested_move = self.get_random_legal_move();
+                // 生成并立即执行随机走法
+                if let Some(random_move) = self.get_random_legal_move() {
+                    self.ai_suggested_move = Some(random_move);
+                    self.execute_ai_move(); // 强制执行随机走法
+                } else {
+                    self.status_message = "无可用走法，游戏结束".to_string();
+                }
             }
         }
     }
@@ -1302,64 +1359,185 @@ impl Default for ChessApp {
 
 impl eframe::App for ChessApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(RichText::new("国际象棋 AI 对战").size(24.0));
-            
-            // 顶部控制面板
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("SiliconFlow API Key：").size(14.0));
-                ui.text_edit_singleline(&mut self.api_key_input);
-                if ui.button("设置API Key").clicked() {
-                    self.chessboard.ai_client = SiliconFlowClient::new(self.api_key_input.clone());
-                    self.chessboard.status_message = "API Key已更新".to_string();
+        // // 设置全局深色主题 + 自定义背景色
+        // ctx.set_visuals(egui::Visuals {
+        //     window_fill: Color32::from_rgb(27, 27, 27),
+        //     ..egui::Visuals::dark()
+        // });
+
+        let horizontal_margin = 20;
+        let vertical_margin = 25;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default()
+                .inner_margin(egui::Margin::symmetric(horizontal_margin, vertical_margin))
+                .fill(Color32::from_rgb(27, 27, 27))
+            )
+            .show(ctx, |ui| {
+                ui.heading(RichText::new("国际象棋 AI 对战").size(24.0).color(Color32::WHITE));
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("硅基流动 API Key：").size(14.0).color(Color32::WHITE));
+                    let text_edit = egui::TextEdit::singleline(&mut self.api_key_input)
+                        .frame(true)
+                        .min_size(Vec2::new(250.0, 28.0));
+                    ui.add(text_edit);
+                    ui.add_space(8.0);
+                    if ui.button("设置 API Key").clicked() {
+                        self.chessboard.ai_client = SiliconFlowClient::new(self.api_key_input.clone());
+                        self.chessboard.status_message = "API Key已更新".to_string();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // 功能按钮
+                ui.horizontal(|ui| {
+                    // 统一按钮样式
+                    let btn_style = |text: &str| egui::Button::new(RichText::new(text).size(14.0))
+                        .min_size(Vec2::new(100.0, 30.0))
+                        .fill(Color32::from_rgb(50, 80, 120));
+
+                    if ui.add(btn_style("获取AI推荐走法")).clicked() {
+                        self.chessboard.get_ai_move();
+                    }
+                    ui.add_space(5.0);
+                    if ui.add(btn_style("执行AI走法")).clicked() {
+                        self.chessboard.execute_ai_move();
+                    }
+                    ui.add_space(5.0);
+                    if ui.add(btn_style("重置棋盘")).clicked() {
+                        self.chessboard = Chessboard::new(self.api_key_input.clone());
+                    }
+                    ui.add_space(15.0);
+
+                    // 显示移动历史复选框（白色文字）
+                    ui.checkbox(
+                        &mut self.chessboard.show_move_history,
+                        RichText::new("显示移动历史").size(14.0).color(Color32::WHITE)
+                    );
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // 状态信息 + 将军提示
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.chessboard.status_message)
+                        .size(16.0)
+                        .color(Color32::WHITE)
+                        .background_color(Color32::from_rgb(40, 60, 90)));
+                    
+                    if self.chessboard.is_in_check(self.chessboard.current_turn) {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(format!("⚠️{}被将军！", self.chessboard.current_turn))
+                            .size(16.0)
+                            .color(Color32::RED));
+                    }
+                });
+                ui.add_space(8.0);
+
+                // 兵升变选择按钮
+                if let Some((_, _, color)) = self.chessboard.pending_promotion {
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.heading(RichText::new("🔹 兵升变选择 🔹").size(18.0).color(Color32::ORANGE));
+                        ui.add_space(10.0);
+
+                        let promo_btn = |text: &str| egui::Button::new(RichText::new(text).size(14.0))
+                            .min_size(Vec2::new(60.0, 25.0))
+                            .fill(Color32::from_rgb(50, 80, 120));
+
+                        if ui.add(promo_btn("后 (Q)")).clicked() {
+                            self.chessboard.execute_promotion(Piece::Queen(color));
+                        }
+                        ui.add_space(5.0);
+                        if ui.add(promo_btn("车 (R)")).clicked() {
+                            self.chessboard.execute_promotion(Piece::Rook(color, false));
+                        }
+                        ui.add_space(5.0);
+                        if ui.add(promo_btn("象 (B)")).clicked() {
+                            self.chessboard.execute_promotion(Piece::Bishop(color));
+                        }
+                        ui.add_space(5.0);
+                        if ui.add(promo_btn("马 (N)")).clicked() {
+                            self.chessboard.execute_promotion(Piece::Knight(color));
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
                 }
+
+                ui.add_space(10.0);
+
+                let width_scale = if self.chessboard.show_move_history { 0.8 } else { 1.0 };
+
+                ui.horizontal(|ui| {
+
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            ui.available_rect_before_wrap().min, 
+                            egui::vec2(ui.available_width() * width_scale, 0.0)
+                        )),
+                        |ui| {
+                            ui.vertical_centered(|ui| {
+                                self.chessboard.draw_board(ui, ctx);
+                            });
+                        }
+                    );
+
+                    if self.chessboard.show_move_history {
+                        ui.separator();
+
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                ui.available_rect_before_wrap().min, 
+                                egui::vec2(ui.available_width(), ui.available_height())
+                            )),
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    ui.heading(RichText::new("移动历史：").size(16.0).color(Color32::WHITE));
+                                    ui.separator();
+                                    ui.add_space(5.0);
+
+                                    // 滚动显示历史（避免溢出）
+                                    egui::ScrollArea::vertical()
+                                        .max_height(ui.available_height() - 40.0)
+                                        .auto_shrink([false; 2])
+                                        .show(ui, |ui| {
+                                            // 处理空历史
+                                            if self.chessboard.move_history.is_empty() {
+                                                ui.label(RichText::new("暂无移动记录")
+                                                    .size(14.0)
+                                                    .color(Color32::GRAY));
+                                            } else {
+                                                // 逐条显示历史（更易读）
+                                                for (i, mv) in self.chessboard.move_history.iter().enumerate() {
+                                                    let wob = if i % 2 == 0 { "白方" } else { "黑方" };
+                                                    ui.label(RichText::new(format!("{}. {} {}", i + 1, wob, mv))
+                                                        .size(14.0));
+                                                    ui.add_space(3.0);
+                                                }
+                                            }
+                                        });
+                                });
+                            }
+                        );
+                    }
+                })
             });
-            
-            ui.separator();
-            
-            // 功能按钮
-            ui.horizontal(|ui| {
-                if ui.button("获取AI推荐走法").clicked() {
-                    self.chessboard.get_ai_move();
-                }
-                if ui.button("执行AI走法").clicked() {
-                    self.chessboard.execute_ai_move();
-                }
-                if ui.button("重置棋盘").clicked() {
-                    self.chessboard = Chessboard::new(self.api_key_input.clone());
-                }
-                if ui.button("显示移动历史").clicked() {
-                    let history = self.chessboard.move_history.join(" | ");
-                    self.chessboard.status_message = format!("移动历史：{}", history);
-                }
-            });
-            
-            ui.separator();
-            
-            // 状态信息
-            ui.label(RichText::new(&self.chessboard.status_message).size(16.0).color(Color32::WHITE));
-            
-            // 将军/将死提示
-            if self.chessboard.is_in_check(self.chessboard.current_turn) {
-                ui.label(RichText::new(format!("⚠️{}被将军！", self.chessboard.current_turn)).size(16.0).color(Color32::RED));
-            }
-            
-            ui.separator();
-            
-            // 居中绘制棋盘
-            ui.vertical_centered(|ui| {
-                self.chessboard.draw_board(ui, ctx);
-            });
-        });
     }
 }
 
 fn main() -> Result<(), eframe::Error> {
     
-
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0]),
+        viewport: egui::ViewportBuilder::default().with_resizable(true)
+            .with_inner_size([1200.0, 900.0]),
         multisampling: 4,
         renderer: eframe::Renderer::Glow,
         ..eframe::NativeOptions::default()
