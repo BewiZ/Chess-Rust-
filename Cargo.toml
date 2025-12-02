@@ -11,3 +11,19 @@ rand = "0.9.2"
 tokio = { version = "1.0", features = ["full"] }
 eframe = "0.33.2"
 egui = "0.33.2"
+winres = "0.1.12"
+winapi = { version = "0.3.9", features = ["winuser", "wingdi"] }
+
+[profile.release]
+opt-level = 3          # 最高优化级别
+lto = true             # 链接时优化（大幅减小体积）
+codegen-units = 1      # 单代码生成单元（提升优化效果）
+strip = true           # 剥离调试信息（减小体积）
+panic = "abort"        # 恐慌时直接终止（替代展开，减小体积）
+
+[package.metadata.winres]
+OriginalFilename = "Chess.exe"
+LegalCopyright = "Copyright © 2025"
+
+[build-dependencies]
+winres = "0.1.12"
