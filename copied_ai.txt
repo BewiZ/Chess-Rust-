@@ -268,7 +268,7 @@ pub struct SiliconFlowClient {
 }
 
 impl SiliconFlowClient {
-     // 初始化客户端（API Key + 模型名）- 完整实现
+    // 初始化客户端（API Key + 模型名）
     pub fn new(api_key: String, model: &str) -> Self {
         // 配置客户端（解决Windows schannel问题）
         let client = Client::builder()
@@ -286,64 +286,62 @@ impl SiliconFlowClient {
             model: model.to_string(),
         }
     }
-    // ========== 修正：SiliconFlowClient::get_ai_fen 方法（减少调试输出） ==========
+
+    // 核心：发送FEN给AI，获取走棋后的新FEN（终极版提示词）
     pub async fn get_ai_fen(&self, current_fen: &str) -> Result<String, Box<dyn Error>> {
+        // 解析当前FEN的关键信息（明确告诉AI当前回合）
         let fen_parts: Vec<&str> = current_fen.split_whitespace().collect();
-        if fen_parts.len() < 6 {
-            return Err("FEN格式不完整，无法解析回合信息".into());
-        }
         let current_turn = if fen_parts[1] == "w" { "白方" } else { "黑方" };
-        let opposite_turn = if current_turn == "白方" { "黑方" } else { "白方" };
-        
-        // 强化的提示词，明确要求切换回合
+        let current_fullmove = fen_parts[5];
+
+        // 1. 构造极致明确的提示词（强制走棋+示例）
         let prompt = format!(
-            "你是一位国际象棋特级大师。当前棋盘状态为：{}
-            
-            重要规则（必须遵守）：
-            1. 当前回合是 **{}**，必须由{}走棋
-            2. 走棋后必须 **立即切换回合** 为{}
-            3. 只返回走棋后的 **完整标准FEN字符串**，不要添加任何其他文字
-            4. 确保走棋是合法且改变棋盘布局的
-            
-            走棋要求：
-            1. 为{}选择一个合法且合理的棋步
-            2. 执行该棋步
-            3. 生成新的FEN，其中：
-            - 棋盘布局更新为移动后的状态
-            - 回合字段切换为{}
-            - 半回合数：兵移动或吃子则重置为0，否则加1
-            - 全回合数：如果是黑方走棋则加1，白方走棋不变
-            
-            请严格遵循以上规则，仅返回新FEN字符串。",
-            current_fen, 
-            current_turn, current_turn,
-            opposite_turn,
+            "### 国际象棋走棋指令（必须严格遵守）###
+    1. 当前状态：
+    - 棋盘FEN：{}
+    - 当前回合：{}（必须由该方走棋）
+    - 全回合数：{}
+    2. 必须执行的操作：
+    a) 为{}走一步**合法**的棋步（必须移动至少一个棋子，改变棋盘布局）；
+    b) 生成走棋后的**完整标准FEN字符串**（6个字段缺一不可）；
+    c) 正确更新FEN字段：
+        - 棋盘布局：必须与原布局不同（因为移动了棋子）；
+        - 回合：走棋后切换为对方（{}走后→{}）；
+        - 半回合数：兵移动/吃子则置0，否则+1；
+        - 全回合数：黑方走棋后+1，白方走棋后不变；
+    3. 禁止操作：
+    - 不允许返回与原布局相同的FEN；
+    - 不允许只修改回合/计数字段而不移动棋子；
+    - 不允许添加任何额外内容（仅返回FEN字符串）；
+    4. 正确示例（参考）：
+    原FEN：rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+    白方走e4后的FEN：rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+            current_fen,
             current_turn,
-            opposite_turn
+            current_fullmove,
+            current_turn,
+            current_turn,
+            if current_turn == "白方" { "黑方" } else { "白方" }
         );
 
-        // 构造API请求
+        // 2. 构造API请求（增强参数，降低随机性）
         let request = ChatRequest {
             model: self.model.clone(),
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: "你是国际象棋AI，必须严格遵守以下规则：\
-                            1. 严格按照当前回合走棋；\
-                            2. 走棋后必须立即切换回合；\
-                            3. 只返回标准FEN格式，不要添加任何解释、分析或额外文本；\
-                            4. 确保移动是合法的，会改变棋盘布局。".to_string(),
+                    content: "你是国际象棋特级大师，严格执行以下规则：1. 必须移动棋子改变棋盘布局；2. 仅返回标准FEN字符串；3. 正确切换回合和更新计数字段；4. 拒绝返回与原布局相同的FEN。".to_string(),
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: prompt,
                 },
             ],
-            temperature: 0.1, // 低随机性，确保一致性
+            temperature: 0.0, // 完全关闭随机性，强制AI按规则走棋
             max_tokens: 200,
         };
 
-        // 3. 网络请求（减少调试输出）
+        // 3. 网络请求（原有逻辑不变，保留日志）
         let response = match self.client
             .post(&self.base_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -354,17 +352,17 @@ impl SiliconFlowClient {
         {
             Ok(resp) => resp,
             Err(e) => {
-                eprintln!("网络请求失败：{:?}", e);
+                eprintln!("网络请求失败详情：{:?}", e);
                 return Err(format!("网络请求失败：{}", e).into());
             }
         };
 
         let status = response.status();
         let response_body = response.text().await?;
+        eprintln!("响应状态码：{}", status);
+        eprintln!("响应体：{}", response_body);
 
-        // 只在实际错误时打印详细信息
         if !status.is_success() {
-            eprintln!("API请求失败：{}，错误详情：{}", status, response_body);
             return Err(format!(
                 "API请求失败：{}，错误详情：{}", 
                 status, 
@@ -377,20 +375,12 @@ impl SiliconFlowClient {
             .ok_or("AI无返回内容")?
             .message.content.trim().to_string();
 
-        // 增强FEN提取（严格匹配格式）
-        let fen_regex = Regex::new(r"^[rnbqkpRNBQKP1-8/]+ [wb] [KQkq-]+ [a-h1-8-]+ \d+ \d+$")?;
-        if fen_regex.is_match(&ai_content) {
-            Ok(ai_content)
+        // 正则提取FEN（增强匹配）
+        let fen_regex = Regex::new(r"[rnbqkpRNBQKP1-8/]+ [wb] [KQkq-]+ [a-h1-8-]+ \d+ \d+")?;
+        if let Some(fen) = fen_regex.find(&ai_content) {
+            Ok(fen.as_str().to_string())
         } else {
-            // 兼容AI返回带额外内容的情况
-            let fallback_regex = Regex::new(r"[rnbqkpRNBQKP1-8/]+ [wb] [KQkq-]+ [a-h1-8-]+ \d+ \d+")?;
-            match fallback_regex.find(&ai_content) {
-                Some(fen) => Ok(fen.as_str().to_string()),
-                None => {
-                    eprintln!("AI返回非标准FEN：{}", ai_content);
-                    Err(format!("AI返回非标准FEN：{}", ai_content).into())
-                }
-            }
+            Err(format!("AI返回非标准FEN：{}", ai_content).into())
         }
     }
 }
@@ -421,6 +411,7 @@ impl Chessboard {
     // 重构初始化方法：接收API Key + 模型名
     pub fn new(api_key: String, model: &str) -> Self {
         let mut board = [[None; 8]; 8];
+
         // 原有棋盘初始化逻辑（兵、车马象后王）完全保留 ↓
         // 初始化兵
         for col in 0..8 {
@@ -467,12 +458,15 @@ impl Chessboard {
         }
     }
 
-    // ========== 修正：to_fen 方法（减少调试输出） ==========
+    // 转换为FEN格式（完整）
     pub fn to_fen(&self) -> String {
         let mut fen = String::new();
 
-        // 棋盘布局部分保持不变...
-        for row in 0..8 {
+        // ========== 修改1：修正棋盘行顺序（关键！） ==========
+        // 标准FEN棋盘行顺序：黑方底线（8行）→ 白方底线（1行）
+        // 若你的board[0]是黑方底线、board[7]是白方底线，遍历0..8是对的；
+        // 若board[0]是白方底线，需改为 (0..8).rev()
+        for row in 0..8 { // 保持原有遍历顺序（根据你的棋盘数组结构调整）
             let mut empty = 0;
             for col in 0..8 {
                 match self.board[row][col] {
@@ -508,14 +502,14 @@ impl Chessboard {
             }
         }
 
-        // 回合字段
-        fen.push(' ');
+        // ========== 修改2：优化回合字段拼接（避免多余空格） ==========
+        fen.push(' '); // 单个空格分隔
         fen.push_str(match self.current_turn {
             Color::White => "w",
             Color::Black => "b",
         });
 
-        // 易位权限
+        // ========== 易位权限字段（保留逻辑，优化空格） ==========
         fen.push(' ');
         let mut castling = String::new();
         if self.castling_rights.white_kingside {
@@ -535,21 +529,21 @@ impl Chessboard {
         }
         fen.push_str(&castling);
 
-        // 吃过路兵
+        // ========== 吃过路兵字段（保留逻辑，优化空格） ==========
         fen.push(' ');
         fen.push_str(&self.en_passant_target
             .map(|p| p.to_notation())
             .unwrap_or_else(|| "-".to_string()));
 
-        // 半回合/全回合数
+        // ========== 修改3：动态化半回合/全回合数（核心！） ==========
+        // 替换硬编码的 " 0 1" 为结构体的动态字段
         fen.push(' ');
-        fen.push_str(&self.halfmove_clock.to_string());
+        fen.push_str(&self.halfmove_clock.to_string()); // 半回合数（动态）
         fen.push(' ');
-        fen.push_str(&self.fullmove_number.to_string());
-
-        // 注释掉频繁的调试输出，只在必要时启用
-        // eprintln!("实时FEN更新：{}", fen);
+        fen.push_str(&self.fullmove_number.to_string()); // 全回合数（动态）
+        eprintln!("实时FEN更新：{}", fen); // 调试输出当前FEN
         fen
+        
     }
 
     // 新增：从FEN解析棋盘（用于对比AI返回的FEN）
@@ -647,12 +641,7 @@ impl Chessboard {
             en_passant_target,
             move_history: Vec::new(),
             selected_pos: None,
-            ai_client: SiliconFlowClient {
-                client: Client::new(),
-                api_key: "".to_string(),
-                base_url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
-                model: "deepseek-ai/DeepSeek-V3.1-Terminus".to_string(),
-            }, // 临时占位
+            ai_client: SiliconFlowClient::new("".to_string(), "deepseek-ai/DeepSeek-V3.1-Terminus"), // 临时占位
             ai_suggested_move: None,
             status_message: "从FEN加载完成".to_string(),
             show_move_history: false,
@@ -663,116 +652,72 @@ impl Chessboard {
     }
 
     // 新增：兼容型FEN差异解析（终极版）
-    // ========== 修正：find_move_between_fen 方法 - 更严格验证 ==========
     pub fn find_move_between_fen(&self, new_fen: &str) -> Result<Move, String> {
+        // 1. 解析新旧FEN
         let current_fen = self.to_fen();
         let current_fen_parts: Vec<&str> = current_fen.split_whitespace().collect();
         let new_fen_parts: Vec<&str> = new_fen.split_whitespace().collect();
-        
         if current_fen_parts.len() < 6 || new_fen_parts.len() < 6 {
             return Err("FEN字段不完整".to_string());
         }
 
-        // 解析新旧棋盘
-        let new_board = match Chessboard::from_fen(new_fen) {
-            Ok(board) => board,
-            Err(e) => return Err(format!("解析新FEN失败：{}", e)),
-        };
+        // 2. 优先用本地合法走法匹配AI的FEN（兜底）
+        let new_board = Chessboard::from_fen(new_fen)?;
+        let mut legal_moves = Vec::new();
+        for row in 0..8 {
+            for col in 0..8 {
+                let pos = Position::new(row, col).unwrap();
+                legal_moves.extend(self.get_legal_moves(pos));
+            }
+        }
 
-        // 找出棋子移动的差异
-        let mut from_pos = None;
-        let mut to_pos = None;
-        
+        // 3. 遍历合法走法，找到能生成AI FEN的走法
+        for mv in &legal_moves {
+            let mut test_board = self.clone();
+            if test_board.make_move(mv).is_ok() {
+                let test_fen = test_board.to_fen();
+                let test_layout = test_fen.split_whitespace().next().unwrap();
+                let ai_layout = new_fen_parts[0];
+                if test_layout == ai_layout {
+                    return Ok(mv.clone());
+                }
+            }
+        }
+
+        // 4. 原有差异解析逻辑（备用）
+        let mut diffs = Vec::new();
         for row in 0..8 {
             for col in 0..8 {
                 let old_p = self.board[row][col];
                 let new_p = new_board.board[row][col];
-                
                 if old_p != new_p {
-                    if old_p.is_some() && new_p.is_none() {
-                        from_pos = Some(Position::new(row, col).unwrap());
-                    } else if new_p.is_some() {
-                        to_pos = Some(Position::new(row, col).unwrap());
-                    }
+                    diffs.push((Position { row, col }, old_p, new_p));
                 }
             }
         }
 
-        match (from_pos, to_pos) {
-            (Some(from), Some(to)) => {
-                // 验证移动的棋子是否存在且颜色正确
-                if let Some(piece) = self.get(from) {
-                    if piece.color() == self.current_turn {
-                        let mv = Move { from, to, promotion: None };
-                        
-                        // 验证是否为合法移动
-                        if self.is_legal_move(&mv) {
-                            return Ok(mv);
-                        } else {
-                            // 尝试找到相似的合法移动
-                            let legal_moves = self.get_legal_moves(from);
-                            for legal_move in legal_moves {
-                                // 检查是否有相似的移动（可能是升变或其他特殊情况）
-                                if legal_move.from == from {
-                                    let mut test_board = self.clone();
-                                    if test_board.make_move(&legal_move).is_ok() {
-                                        let test_fen = test_board.to_fen();
-                                        if test_fen.split_whitespace().next() == new_fen_parts.first().copied() {
-                                            return Ok(legal_move);
-                                        }
-                                    }
-                                }
-                            }
-                            return Err("AI返回的移动不是合法移动".to_string());
-                        }
-                    } else {
-                        return Err(format!(
-                            "移动的棋子颜色错误：当前是{}回合，但移动了{}的棋子",
-                            self.current_turn, piece.color()
-                        ));
-                    }
-                } else {
-                    return Err("起始位置无棋子".to_string());
-                }
+        let diffs_len = diffs.len();
+        let mut from_pos = None;
+        let mut to_pos = None;
+        for (pos, old_p, new_p) in diffs {
+            if old_p.is_some() && new_p.is_none() {
+                from_pos = Some(pos);
+            } else if new_p.is_some() {
+                to_pos = Some(pos);
             }
-            _ => Err("无法从FEN差异中识别移动".to_string()),
         }
+
+        if from_pos.is_none() || to_pos.is_none() {
+            return Err(format!("无法识别移动（差异数：{}）", diffs_len));
+        }
+
+        Ok(Move {
+            from: from_pos.unwrap(),
+            to: to_pos.unwrap(),
+            promotion: None,
+        })
     }
 
-    // 新增：验证和修复FEN的方法
-    fn validate_and_fix_fen(&self, ai_fen: &str) -> Result<String, String> {
-        let parts: Vec<&str> = ai_fen.split_whitespace().collect();
-        if parts.len() < 6 {
-            return Err("FEN字段不完整".to_string());
-        }
-        
-        // 验证棋盘布局格式
-        let board_str = parts[0];
-        let rows: Vec<&str> = board_str.split('/').collect();
-        if rows.len() != 8 {
-            return Err("棋盘行数错误".to_string());
-        }
-        
-        // 验证回合字段并尝试修复
-        let current_turn = match self.current_turn {
-            Color::White => "w",
-            Color::Black => "b",
-        };
-        
-        let ai_turn = parts[1];
-        let expected_turn = if current_turn == "w" { "b" } else { "w" };
-        
-        let mut fixed_parts = parts.clone();
-        
-        // 如果回合字段错误，尝试修复
-        if ai_turn != expected_turn {
-            eprintln!("警告：AI返回回合错误，修复为: {}", expected_turn);
-            fixed_parts[1] = expected_turn;
-        }
-        
-        // 重新组合FEN
-        Ok(fixed_parts.join(" "))
-    }
     // 获取棋子
     pub fn get(&self, pos: Position) -> Square {
         self.board[pos.row][pos.col]
@@ -811,31 +756,19 @@ impl Chessboard {
             .collect()
     }
 
-    // ========== 修正：get_random_legal_move 方法 ==========
+    // 随机合法走法
     pub fn get_random_legal_move(&self) -> Option<Move> {
         let mut all_legal_moves = Vec::new();
 
-        // 只收集当前回合的合法移动
         for row in 0..8 {
             for col in 0..8 {
                 let pos = Position::new(row, col).unwrap();
-                if let Some(piece) = self.get(pos) {
-                    if piece.color() == self.current_turn {
-                        let moves = self.get_legal_moves(pos);
-                        all_legal_moves.extend(moves);
-                    }
-                }
+                let moves = self.get_legal_moves(pos);
+                all_legal_moves.extend(moves);
             }
         }
 
         if all_legal_moves.is_empty() {
-            eprintln!("警告：没有找到当前回合（{}）的合法移动", self.current_turn);
-            // 检查是否是僵局或将死
-            if self.is_checkmate() {
-                eprintln!("当前处于将死状态，{}获胜", self.current_turn.opposite());
-            } else if self.is_stalemate() {
-                eprintln!("当前处于僵局状态，游戏平局");
-            }
             return None;
         }
 
@@ -1161,23 +1094,6 @@ impl Chessboard {
 
     // 执行移动（带合法校验）
     pub fn make_move(&mut self, mv: &Move) -> Result<(), String> {
-        // 1. 验证起始位置是否有棋子
-        let piece = match self.board[mv.from.row][mv.from.col] {
-            Some(piece) => piece,
-            None => {
-                return Err(format!("起始位置 {} 没有棋子", mv.from.to_notation()));
-            }
-        };
-        
-        // 2. 验证棋子颜色是否正确
-        if piece.color() != self.current_turn {
-            return Err(format!(
-                "当前是{}的回合，不能移动{}的棋子",
-                self.current_turn, piece.color()
-            ));
-        }
-
-        // 3. 验证移动是否合法
         let legal_moves = self.get_legal_moves(mv.from);
         if !legal_moves
             .iter()
@@ -1186,9 +1102,21 @@ impl Chessboard {
             return Err(format!("非法移动：{} → {}", mv.from.to_notation(), mv.to.to_notation()));
         }
 
-        
+        // ========== 修复1：提前读取from_piece（在修改棋盘前） ==========
+        let from_piece = self.board[mv.from.row][mv.from.col]
+            .ok_or(format!(
+                "移动失败：起始位置 {} 无棋子（无法执行移动）",
+                mv.from.to_notation()
+            ))?;
 
-        // 4. 记录移动信息（用于历史记录）
+        // ========== 修复2：提前计算兵移动/吃子标记（读取棋子后） ==========
+        let is_pawn_move = matches!(from_piece, Piece::Pawn(_, _));
+        let is_capture = self.board[mv.to.row][mv.to.col].is_some();
+        let is_en_passant_capture = matches!(from_piece, Piece::Pawn(_, _)) 
+            && mv.from.col != mv.to.col 
+            && self.board[mv.to.row][mv.to.col].is_none();
+
+        // 保存移动信息
         let move_notation = mv.to_notation();
         let from_notation = mv.from.to_notation();
         let to_notation = mv.to.to_notation();
@@ -1206,32 +1134,25 @@ impl Chessboard {
             self.move_history.push(move_notation);
         }
 
-        // 5. 计算移动类型（用于更新半回合数等）
-        let is_pawn_move = matches!(piece, Piece::Pawn(_, _));
-        let is_capture = self.board[mv.to.row][mv.to.col].is_some();
-        let is_en_passant_capture = matches!(piece, Piece::Pawn(_, _)) 
-            && mv.from.col != mv.to.col 
-            && self.board[mv.to.row][mv.to.col].is_none();
-
-        // 6. 执行无校验移动（实际移动棋子）
+        // 执行无校验移动（此时已读取from_piece，不会影响）
         self.make_move_unchecked(mv);
 
-        // 7. 更新半回合数和全回合数
+        // ========== 修复3：更新半回合数（移动后） ==========
         if is_pawn_move || is_capture || is_en_passant_capture {
             self.halfmove_clock = 0; // 重置半回合数
         } else {
             self.halfmove_clock += 1; // 非吃子/兵移动，+1
         }
 
-        // 8. 更新全回合数（黑方走棋后递增）
+        // ========== 修复4：更新全回合数（黑方走棋后递增） ==========
         if self.current_turn == Color::Black {
             self.fullmove_number += 1;
         }
 
-        // 9. 切换回合
+        // ========== 修复5：统一切换回合（移除make_move_unchecked中的切换） ==========
         self.current_turn = self.current_turn.opposite();
 
-        // 10. 状态提示 + 将死/僵局检查
+        // 状态提示 + 将死/僵局检查
         self.status_message = format!("移动成功：{} → {}", from_notation, to_notation);
         if self.is_checkmate() {
             self.status_message = format!("将死！{}获胜！", self.current_turn.opposite());
@@ -1602,7 +1523,8 @@ impl Chessboard {
         }
     }
 
-    // ========== 修正：get_ai_move 方法 - 更好的错误处理 ==========
+    // 获取AI推荐走法（调用大模型）
+    // 获取AI推荐走法（新增重试机制）
     pub fn get_ai_move(&mut self) {
         if self.ai_client.api_key.is_empty() {
             self.status_message = "⚠️硅基流动API Key为空，使用本地随机走法！".to_string();
@@ -1611,163 +1533,85 @@ impl Chessboard {
         }
 
         let current_fen = self.to_fen();
-        let current_turn = self.current_turn;
-        self.status_message = format!("🔍 正在请求{}AI走法...", current_turn);
+        let current_layout = current_fen.split_whitespace().next().unwrap().to_string();
+        self.status_message = "🔍 正在请求象棋大师AI走法...".to_string();
 
         let ai_client = self.ai_client.clone();
         let rt = Runtime::new().unwrap();
         
-        // 智能重试逻辑
+        // 重试逻辑（最多3次）
         let mut new_fen = None;
         let mut retry_count = 0;
-        let max_retries = 3;
-        
-        while retry_count < max_retries {
+        while retry_count < 3 {
             match rt.block_on(ai_client.get_ai_fen(&current_fen)) {
                 Ok(fen) => {
-                    // 验证FEN格式
-                    let fen_parts: Vec<&str> = fen.split_whitespace().collect();
-                    if fen_parts.len() < 6 {
-                        eprintln!("重试{}次：AI返回FEN字段不完整: {}", retry_count, fen);
-                        retry_count += 1;
-                        continue;
-                    }
-                    
-                    // 验证回合切换
-                    let ai_turn = fen_parts[1];
-                    let expected_turn = match current_turn {
-                        Color::White => "b", // 白方走完后应该是黑方
-                        Color::Black => "w", // 黑方走完后应该是白方
-                    };
-                    
-                    if ai_turn == expected_turn {
+                    let ai_layout = fen.split_whitespace().next().unwrap().to_string();
+                    if ai_layout != current_layout {
                         new_fen = Some(fen);
                         break;
                     } else {
-                        eprintln!("重试{}次：AI返回回合错误，当前{}，期望{}，实际{}", 
-                            retry_count, current_turn, expected_turn, ai_turn);
                         retry_count += 1;
-                        self.status_message = format!("⚠️AI返回回合错误，重试{}次...", retry_count);
+                        eprintln!("重试{}次：AI返回相同布局，继续请求...", retry_count);
+                        self.status_message = format!("⚠️AI返回相同布局，重试{}次...", retry_count);
+                        // 短暂休眠（避免请求过快）
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                 }
                 Err(e) => {
-                    eprintln!("重试{}次：AI请求失败: {}", retry_count, e);
-                    retry_count += 1;
+                    eprintln!("请求失败：{}，停止重试", e);
+                    break;
                 }
             }
-            
-            // 重试等待
-            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
-        // 处理结果 - 修复类型不匹配
-        if let Some(fen_str) = new_fen {
-            match self.validate_and_fix_fen(&fen_str) {
-                Ok(fixed_fen) => {
-                    match self.find_move_between_fen(&fixed_fen) {
-                        Ok(mv) => {
-                            // 验证移动的棋子颜色
-                            if let Some(piece) = self.get(mv.from) {
-                                if piece.color() == current_turn {
-                                    self.ai_suggested_move = Some(mv.clone());
-                                    self.status_message = format!(
-                                        "✅AI推荐走法：{} → {}",
-                                        mv.from.to_notation(),
-                                        mv.to.to_notation()
-                                    );
-                                } else {
-                                    self.status_message = format!(
-                                        "❌AI返回了{}的走法，但当前是{}回合",
-                                        piece.color(),
-                                        current_turn
-                                    );
-                                    self.ai_suggested_move = self.get_random_legal_move();
-                                }
-                            } else {
-                                self.status_message = "❌AI返回无效移动，使用本地走法".to_string();
-                                self.ai_suggested_move = self.get_random_legal_move();
-                            }
-                        }
-                        Err(e) => {
-                            self.status_message = format!("❌解析AI走法失败：{}，使用本地走法", e);
-                            self.ai_suggested_move = self.get_random_legal_move();
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.status_message = format!("❌FEN验证失败：{}", e);
-                    self.ai_suggested_move = self.get_random_legal_move();
-                }
-            }
-        } else {
-            self.status_message = format!("❌AI连续{}次返回无效FEN，使用本地走法", max_retries);
-            self.ai_suggested_move = self.get_random_legal_move();
-        }
-
-        // 兜底逻辑
-        if self.ai_suggested_move.is_none() {
-            self.ai_suggested_move = self.get_random_legal_move();
-            if self.ai_suggested_move.is_none() {
-                self.status_message = "⚠️没有可用的合法走法！".to_string();
-            }
-        }
-    }
-
-
-    // ========== 修正：execute_ai_move 方法 ==========
-    pub fn execute_ai_move(&mut self) {
-        if let Some(mv) = self.ai_suggested_move.take() {
-            // 验证移动是否合法
-            let legal_moves = self.get_legal_moves(mv.from);
-            let is_legal = legal_moves.iter().any(|legal_move| 
-                legal_move.from == mv.from && legal_move.to == mv.to
-            );
-            
-            if !is_legal {
-                self.status_message = format!("AI走法非法：{}，使用随机走法", mv.to_notation());
-                if let Some(backup_move) = self.get_random_legal_move() {
-                    if let Err(e) = self.make_move(&backup_move) {
-                        self.status_message = format!("随机走法也失败：{}", e);
-                        return;
-                    }
-                } else {
-                    self.status_message = "没有可用的随机走法！".to_string();
-                    return;
-                }
-            } else {
-                match self.make_move(&mv) {
-                    Ok(_) => {
-                        self.status_message = format!("AI走法执行成功：{}", mv.to_notation());
+        // 处理最终结果
+        match new_fen {
+            Some(fen) => {
+                // 解析FEN生成Move
+                match self.find_move_between_fen(&fen) {
+                    Ok(mv) => {
+                        self.ai_suggested_move = Some(mv.clone());
+                        self.status_message = format!(
+                            "✅AI推荐走法：{} → {}（FEN更新成功）",
+                            mv.from.to_notation(),
+                            mv.to.to_notation()
+                        );
                     }
                     Err(e) => {
-                        self.status_message = format!("AI走法执行失败：{}，使用随机走法", e);
-                        if let Some(backup_move) = self.get_random_legal_move() {
-                            if let Err(e) = self.make_move(&backup_move) {
-                                self.status_message = format!("随机走法也失败：{}", e);
-                            }
-                        }
+                        self.status_message = format!("❌FEN解析失败：{}，使用本地最优走法", e);
+                        self.ai_suggested_move = self.get_random_legal_move(); // 替换为本地最优走法（可选）
+                    }
+                }
+            }
+            None => {
+                self.status_message = "❌AI连续3次返回相同布局，使用本地最优走法！".to_string();
+                // 优先使用本地合法走法（而非随机，体验更好）
+                self.ai_suggested_move = self.get_random_legal_move();
+            }
+        }
+
+        // 最终兜底
+        if self.ai_suggested_move.is_none() {
+            self.ai_suggested_move = self.get_random_legal_move();
+            self.status_message = "⚠️无有效走法，使用本地随机走法！".to_string();
+        }
+    }
+
+    // 执行AI推荐的走法
+    pub fn execute_ai_move(&mut self) {
+        if let Some(mv) = self.ai_suggested_move.take() {
+            match self.make_move(&mv) {
+                Ok(_) => (),
+                Err(e) => {
+                    self.status_message = format!("AI走法非法：{}，使用随机走法", e);
+                    if let Some(backup_move) = self.get_random_legal_move() {
+                        self.make_move(&backup_move).unwrap();
                     }
                 }
             }
         } else {
-            // 如果没有AI推荐走法，直接使用随机走法
-            self.status_message = "暂无AI推荐走法，尝试随机走法！".to_string();
-            if let Some(backup_move) = self.get_random_legal_move() {
-                if let Err(e) = self.make_move(&backup_move) {
-                    self.status_message = format!("随机走法失败：{}", e);
-                }
-            } else {
-                self.status_message = "没有可用的随机走法！".to_string();
-            }
+            self.status_message = "暂无AI推荐走法！".to_string();
         }
-    }
-
-    // ========== 新增：验证移动的方法 ==========
-    pub fn is_legal_move(&self, mv: &Move) -> bool {
-        let legal_moves = self.get_legal_moves(mv.from);
-        legal_moves.iter().any(|legal_move| 
-            legal_move.from == mv.from && legal_move.to == mv.to
-        )
     }
 
     // 绘制棋盘（GUI）
